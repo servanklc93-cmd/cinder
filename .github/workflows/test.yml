@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]" pyflakes
+      - run: python -m pyflakes cinder tests bench
+      - run: python -c "import sqlite3; print('sqlite', sqlite3.sqlite_version)"
+      - run: pytest -v
+      - name: cli smoke test
+        run: |
+          cinder ci.db "CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT); INSERT INTO t (x) VALUES ('hello');"
+          test "$(cinder ci.db 'SELECT x FROM t;' | tail -1)" = "hello"
