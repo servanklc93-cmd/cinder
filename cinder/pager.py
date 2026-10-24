@@ -20,6 +20,11 @@ import struct
 import zlib
 from collections import OrderedDict
 
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+
 PAGE_SIZE = 4096
 MAGIC = b"cinder format 1\x00"
 HEADER = struct.Struct(">16sHIII")  # magic, page size, page count, freelist head, schema root
@@ -37,12 +42,17 @@ class CorruptDatabase(Exception):
     pass
 
 
+class DatabaseLocked(Exception):
+    pass
+
+
 class Pager:
     def __init__(self, path):
         self.path = path
         self.journal_path = path + "-journal"
         exists = os.path.exists(path) and os.path.getsize(path) > 0
         self.file = open(path, "r+b" if exists else "w+b")
+        self._lock()
 
         if os.path.exists(self.journal_path):
             self._recover()
@@ -61,6 +71,17 @@ class Pager:
             self.schema_root = 0
             self._write_header_to_disk()
         self._committed_header = (self.page_count, self.freelist, self.schema_root)
+
+    def _lock(self):
+        # one process at a time. two writers would each journal and overwrite
+        # pages on their own and corrupt the file; better to refuse up front.
+        if fcntl is None:
+            return
+        try:
+            fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.file.close()
+            raise DatabaseLocked(f"database is locked: {self.path} is open in another process") from None
 
     # --- header ---------------------------------------------------------------
 
@@ -264,7 +285,7 @@ class Pager:
 
     def close(self):
         self.rollback()
-        self.file.close()
+        self.file.close()  # closing the file releases the lock
 
 
 def _fsync_dir(path):

@@ -142,3 +142,24 @@ def test_a_torn_journal_is_ignored(path):
     p = Pager(path)
     assert p.read(pg)[0] == 7
     assert not os.path.exists(path + "-journal")
+
+
+LOCK_SCRIPT = textwrap.dedent("""
+    import sys
+    from cinder.pager import Pager, DatabaseLocked
+    try:
+        Pager(sys.argv[1])
+    except DatabaseLocked as e:
+        print("locked:", e)
+        sys.exit(3)
+""")
+
+
+def test_a_second_process_cannot_open_it(path):
+    p = Pager(path)
+    result = subprocess.run([sys.executable, "-c", LOCK_SCRIPT, path], capture_output=True, text=True)
+    assert result.returncode == 3, result.stderr
+    assert "is open in another process" in result.stdout
+    p.close()
+    # released on close
+    assert subprocess.run([sys.executable, "-c", LOCK_SCRIPT, path]).returncode == 0
