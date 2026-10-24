@@ -313,7 +313,7 @@ class BTree:
         prev = None
 
         def walk(pgno, low, high, depth):
-            nonlocal count, prev
+            nonlocal count
             node = self._load(pgno)
             if node.keys != sorted(node.keys):
                 raise TreeError(f"keys out of order in page {pgno}")
