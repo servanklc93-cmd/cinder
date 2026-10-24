@@ -205,22 +205,36 @@ def test_random_queries_match_sqlite(dbs, seed):
         assert got == expected, f"\n  {sql}\n  sqlite: {expected[:8]}\n  cinder: {got[:8]}"
 
 
+@pytest.mark.parametrize("in_transaction", [False, True])
 @pytest.mark.parametrize("seed", range(3))
-def test_random_writes_match_sqlite(tmp_path, seed):
+def test_random_writes_match_sqlite(tmp_path, seed, in_transaction):
+    # inside one big transaction, a statement that fails (a UNIQUE violation,
+    # say) must be undone on its own while everything before it stays
     rng = random.Random(100 + seed)
-    lite = sqlite3.connect(":memory:")
+    lite = sqlite3.connect(":memory:", isolation_level=None)
     ours = cinder.connect(str(tmp_path / "w.db"))
     for sql in SCHEMA[:1] + SCHEMA[2:4]:
         lite.execute(sql.replace(")", ") STRICT", 1) if sql.startswith("CREATE TABLE") else sql)
         ours.execute(sql)
 
     g = Gen(rng, [("t1", "t1")])
+    if in_transaction:
+        lite.execute("BEGIN")
+        ours.execute("BEGIN")
+    errors = 0
     for step in range(400):
         r = rng.random()
-        if r < 0.5:
-            row = (rng.choice([None, rng.randint(1, 300)]), rng.randint(-6, 6), rng.choice(TEXTS), rng.randint(-8, 8) / 4)
+        existing = [i for (i,) in lite.execute("SELECT id FROM t1").fetchall()]
+        if r < 0.4:
+            row = (rng.choice([None, rng.randint(1, 120)]), rng.randint(-6, 6), rng.choice(TEXTS), rng.randint(-8, 8) / 4)
             sql = "INSERT INTO t1 (id, a, b, c) VALUES (?, ?, ?, ?)"
             args = row
+        elif r < 0.55 and existing:
+            # two good rows, then one that collides: the whole statement has to
+            # be undone, including the two rows (and index entries) it already wrote
+            dup = rng.choice(existing)
+            sql = "INSERT INTO t1 (id, a, b) VALUES (NULL, ?, ?), (NULL, ?, ?), (?, 0, 'dup')"
+            args = (rng.randint(-6, 6), rng.choice(TEXTS), rng.randint(-6, 6), rng.choice(TEXTS), dup)
         elif r < 0.8:
             sql = f"UPDATE t1 SET a = {g.int_expr()}, b = {g.text_expr()} WHERE {g.predicate()}"
             args = ()
@@ -236,7 +250,12 @@ def test_random_writes_match_sqlite(tmp_path, seed):
             except Exception as e:
                 outcome.append(("error", type(e).__name__ in ("IntegrityError", "SQLError")))
         assert outcome[0] == outcome[1], f"step {step}: {sql_unqualified} {args}\n  sqlite {outcome[0]} cinder {outcome[1]}"
+        errors += outcome[0][0] == "error"
 
+    assert errors > 10  # the failure paths really were exercised
+    if in_transaction:
+        lite.execute("COMMIT")
+        ours.execute("COMMIT")
     final = "SELECT * FROM t1 ORDER BY id"
     assert normalize(ours.execute(final).rows) == normalize(lite.execute(final).fetchall())
     # and the indexes agree with the table
