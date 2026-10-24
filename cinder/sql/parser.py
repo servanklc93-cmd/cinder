@@ -16,6 +16,11 @@ Operator precedence follows SQLite, lowest first:
 from . import ast
 from .lexer import SQLSyntaxError, tokenize
 
+# parentheses, function calls, CASE and unary minus nested deeper than this
+# are rejected. each level costs ~11 Python frames in this parser, so 64
+# stays well inside the default recursion limit. real queries rarely go past 10.
+MAX_EXPR_DEPTH = 64
+
 TYPE_NAMES = {
     "INTEGER": "INTEGER", "INT": "INTEGER", "BIGINT": "INTEGER", "SMALLINT": "INTEGER",
     "BOOLEAN": "INTEGER", "BOOL": "INTEGER",
@@ -29,6 +34,7 @@ class Parser:
         self.sql = sql
         self.tokens = tokenize(sql)
         self.pos = 0
+        self.depth = 0
         self.param_count = sum(1 for t in self.tokens if t.kind == "param")
 
     # --- helpers --------------------------------------------------------------
@@ -317,7 +323,13 @@ class Parser:
     # --- expressions ----------------------------------------------------------
 
     def expr(self):
-        return self.or_expr()
+        self.depth += 1
+        if self.depth > MAX_EXPR_DEPTH:
+            raise self.error(f"expression nested more than {MAX_EXPR_DEPTH} levels deep")
+        try:
+            return self.or_expr()
+        finally:
+            self.depth -= 1
 
     def or_expr(self):
         left = self.and_expr()
@@ -332,9 +344,15 @@ class Parser:
         return left
 
     def not_expr(self):
-        if self.accept_kw("NOT"):
-            return ast.Unary("NOT", self.not_expr())
-        return self.equality()
+        nots = 0
+        while self.accept_kw("NOT"):  # a loop, so NOT NOT NOT ... can't recurse
+            nots += 1
+        e = self.equality()
+        # NOT NOT NOT x is NOT x. two NOTs aren't a no-op though (NOT NOT 5 is
+        # 1), so a chain collapses to one NOT if odd, two if even
+        for _ in range(2 - nots % 2 if nots else 0):
+            e = ast.Unary("NOT", e)
+        return e
 
     def equality(self):
         left = self.comparison()
@@ -402,7 +420,13 @@ class Parser:
     def unary(self):
         if self.at("op") and self.tok.value in ("-", "+"):
             op = self.advance().value
-            operand = self.unary()
+            self.depth += 1
+            if self.depth > MAX_EXPR_DEPTH:
+                raise self.error(f"expression nested more than {MAX_EXPR_DEPTH} levels deep")
+            try:
+                operand = self.unary()
+            finally:
+                self.depth -= 1
             # fold negative literals so -5 is a plain literal (matters for LIMIT etc.)
             if op == "-" and isinstance(operand, ast.Literal) and isinstance(operand.value, (int, float)) \
                     and not isinstance(operand.value, bool):

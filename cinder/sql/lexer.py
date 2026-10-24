@@ -44,6 +44,8 @@ def tokenize(sql):
     pos = 0
     params = 0
     while pos < len(sql):
+        if sql.startswith("/*", pos) and sql.find("*/", pos + 2) == -1:
+            raise SQLSyntaxError("unterminated comment", pos, sql)
         m = _TOKEN.match(sql, pos)
         if not m:
             if sql[pos] == "'":

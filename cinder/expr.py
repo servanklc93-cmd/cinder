@@ -58,34 +58,13 @@ class Context:
 
 
 def walk(e):
-    """Every node of an expression tree, depth first."""
-    yield e
-    if isinstance(e, ast.Unary):
-        yield from walk(e.operand)
-    elif isinstance(e, ast.Binary):
-        yield from walk(e.left)
-        yield from walk(e.right)
-    elif isinstance(e, ast.IsNull):
-        yield from walk(e.operand)
-    elif isinstance(e, ast.Between):
-        yield from walk(e.operand)
-        yield from walk(e.low)
-        yield from walk(e.high)
-    elif isinstance(e, ast.InList):
-        yield from walk(e.operand)
-        for item in e.items:
-            yield from walk(item)
-    elif isinstance(e, ast.Call):
-        for a in e.args:
-            yield from walk(a)
-    elif isinstance(e, ast.Case):
-        if e.operand is not None:
-            yield from walk(e.operand)
-        for cond, result in e.whens:
-            yield from walk(cond)
-            yield from walk(result)
-        if e.default is not None:
-            yield from walk(e.default)
+    """Every node of an expression tree. Iterative, so a WHERE with a few
+    thousand ANDs doesn't hit Python's recursion limit."""
+    stack = [e]
+    while stack:
+        n = stack.pop()
+        yield n
+        stack.extend(reversed(_children(n)))
 
 
 def columns_in(e):
@@ -95,18 +74,16 @@ def columns_in(e):
 def aggregates_in(e):
     """Aggregate calls in an expression (not looking inside them)."""
     found = []
-
-    def visit(n):
+    stack = [e]
+    while stack:
+        n = stack.pop()
         if isinstance(n, ast.Call) and is_aggregate(n):
             for a in n.args:
                 if any(isinstance(x, ast.Call) and is_aggregate(x) for x in walk(a)):
                     raise SQLError(f"misuse of aggregate function {n.name}()")
             found.append(n)
-            return
-        for child in _children(n):
-            visit(child)
-
-    visit(e)
+            continue
+        stack.extend(reversed(_children(n)))
     return found
 
 
@@ -134,11 +111,21 @@ def _children(n):
 
 
 def split_and(e):
-    if e is None:
-        return []
-    if isinstance(e, ast.Binary) and e.op == "AND":
-        return split_and(e.left) + split_and(e.right)
-    return [e]
+    return _flatten(e, "AND") if e is not None else []
+
+
+def _flatten(e, op):
+    """a AND b AND c -> [a, b, c], without recursion (the tree is left-deep)."""
+    out = []
+    stack = [e]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, ast.Binary) and n.op == op:
+            stack.append(n.right)
+            stack.append(n.left)
+        else:
+            out.append(n)
+    return out
 
 
 _ARITH = {"+", "-", "*", "/", "%"}
@@ -177,24 +164,41 @@ def compile_expr(e, ctx):
             return lambda row: sql_not(f(row))
         return f  # unary + does nothing in SQLite
 
+    if isinstance(e, ast.Binary) and e.op in ("AND", "OR") and ctx.lookup is None:
+        # compile a whole chain at once: one closure looping over the terms
+        # instead of one closure per AND nested a thousand deep
+        terms = [compile_expr(t, ctx) for t in _flatten(e, e.op)]
+        if e.op == "AND":
+            def f_and(row):
+                result = 1
+                for t in terms:
+                    v = truth(t(row))
+                    if v == 0:
+                        return 0
+                    if v is None:
+                        result = None
+                return result
+            return f_and
+
+        def f_or(row):
+            result = 0
+            for t in terms:
+                v = truth(t(row))
+                if v == 1:
+                    return 1
+                if v is None:
+                    result = None
+            return result
+        return f_or
+
     if isinstance(e, ast.Binary):
         fa = compile_expr(e.left, ctx)
         fb = compile_expr(e.right, ctx)
         op = e.op
         if op == "AND":
-            def f_and(row):
-                a = fa(row)
-                if truth(a) == 0:
-                    return 0
-                return sql_and(a, fb(row))
-            return f_and
+            return lambda row: sql_and(fa(row), fb(row))
         if op == "OR":
-            def f_or(row):
-                a = fa(row)
-                if truth(a) == 1:
-                    return 1
-                return sql_or(a, fb(row))
-            return f_or
+            return lambda row: sql_or(fa(row), fb(row))
         if op in _ARITH:
             return lambda row: arith(op, fa(row), fb(row))
         if op in _CMP:
@@ -290,6 +294,8 @@ def unparse(e):
         return str(e)
     if isinstance(e, ast.Unary):
         return f"NOT {unparse(e.operand)}" if e.op == "NOT" else f"{e.op}{unparse(e.operand)}"
+    if isinstance(e, ast.Binary) and e.op in ("AND", "OR"):
+        return f" {e.op} ".join(unparse(t) for t in _flatten(e, e.op))
     if isinstance(e, ast.Binary):
         return f"{unparse(e.left)} {e.op} {unparse(e.right)}"
     if isinstance(e, ast.IsNull):

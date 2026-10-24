@@ -62,14 +62,16 @@ class Database:
 
     def execute(self, sql, params=()):
         self._check_open()
-        return self._run(parse_one(sql), sql, list(params))
+        with _too_complex_guard():
+            return self._run(parse_one(sql), sql, list(params))
 
     def executescript(self, sql):
         """Run several ;-separated statements; returns the last result."""
         self._check_open()
         result = Result()
-        for stmt in parse(sql):
-            result = self._run(stmt, sql, [])
+        with _too_complex_guard():
+            for stmt in parse(sql):
+                result = self._run(stmt, sql, [])
         return result
 
     def _run(self, stmt, sql, params):
@@ -331,6 +333,19 @@ class Database:
 
     def tables(self):
         return sorted(t.name for t in self.catalog.tables.values())
+
+
+class _too_complex_guard:
+    """Turn a blown recursion limit (say, a 100k-term arithmetic chain) into a
+    normal SQL error. By then _run has already undone the statement."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, exc, tb):
+        if kind is RecursionError:
+            raise SQLError("expression is too complex") from None
+        return False
 
 
 def _statement_text(sql, stmt):

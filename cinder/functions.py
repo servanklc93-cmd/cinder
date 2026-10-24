@@ -131,6 +131,20 @@ def f_scalar_max(*args):
     return best
 
 
+def f_char(*codes):
+    try:
+        return "".join(chr(int(to_number(c))) for c in codes if c is not None)
+    except (ValueError, OverflowError):
+        raise SQLError("char() code point out of range") from None
+
+
+def f_unicode(s):
+    if s is None:
+        return None
+    s = to_text(s)
+    return ord(s[0]) if s else None
+
+
 # name -> (function, min args, max args)
 SCALARS = {
     "LENGTH": (f_length, 1, 1),
@@ -149,6 +163,8 @@ SCALARS = {
     "IFNULL": (f_coalesce, 2, 2),
     "NULLIF": (f_nullif, 2, 2),
     "TYPEOF": (type_name, 1, 1),
+    "CHAR": (f_char, 1, 99),
+    "UNICODE": (f_unicode, 1, 1),
     # MIN/MAX with two or more arguments are scalar, with one they aggregate
     "MIN": (f_scalar_min, 2, 99),
     "MAX": (f_scalar_max, 2, 99),

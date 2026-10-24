@@ -114,7 +114,7 @@ def arith(op, a, b):
             q = abs(a) // abs(b)
             r = q if (a < 0) == (b < 0) else -q
         else:
-            return a / b
+            r = a / b
     elif op == "%":
         # SQLite casts both sides to integers first, and keeps a real result real
         ia, ib = int(a), int(b)
@@ -126,6 +126,8 @@ def arith(op, a, b):
             return float(r)
     else:
         raise SQLError(f"unknown operator {op}")
+    if isinstance(r, float) and r != r:
+        return None  # inf - inf and friends: SQLite has no NaN, it gives NULL
     return _int_or_real(r) if isinstance(r, int) else r
 
 
