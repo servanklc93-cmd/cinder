@@ -12,6 +12,7 @@ transaction stays, like SQLite.
 """
 
 import os
+from collections import OrderedDict
 
 from .btree import BTree, DuplicateKey, TreeError
 from .catalog import Catalog
@@ -57,13 +58,28 @@ class Database:
         self.catalog = Catalog(self.pager)
         self.in_transaction = False
         self.closed = False
+        self._parsed = OrderedDict()   # sql text -> statement, for repeated DML
 
     # --- running SQL --------------------------------------------------------------
 
     def execute(self, sql, params=()):
         self._check_open()
         with _too_complex_guard():
-            return self._run(parse_one(sql), sql, list(params))
+            return self._run(self._parse(sql), sql, list(params))
+
+    def _parse(self, sql):
+        stmt = self._parsed.get(sql)
+        if stmt is not None:
+            self._parsed.move_to_end(sql)
+            return stmt
+        stmt = parse_one(sql)
+        # DDL statements get modified while they're applied, so only cache
+        # the statements that are run over and over with new parameters
+        if isinstance(stmt, (ast.Select, ast.Insert, ast.Update, ast.Delete)):
+            self._parsed[sql] = stmt
+            if len(self._parsed) > 256:
+                self._parsed.popitem(last=False)
+        return stmt
 
     def executescript(self, sql):
         """Run several ;-separated statements; returns the last result."""
@@ -110,7 +126,9 @@ class Database:
             else:
                 self._rollback()
             raise
-        if not self.in_transaction:
+        if savepoint is not None:
+            self.pager.release()
+        else:
             self.pager.commit()
         return result
 

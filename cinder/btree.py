@@ -64,6 +64,11 @@ class Node:
 
     @classmethod
     def load(cls, pager, pgno):
+        # parsing a page into lists is the expensive part of every lookup, so
+        # parsed nodes are cached; pager.write() drops the entry for a page
+        cached = pager.nodes.get(pgno)
+        if cached is not None:
+            return cached
         page = pager.read(pgno)
         kind, count, link = NODE_HEADER.unpack_from(page, 0)
         if kind not in (LEAF, INTERIOR):
@@ -86,6 +91,7 @@ class Node:
                 node.keys.append(bytes(page[pos:pos + klen]))
                 pos += klen
             node.children.append(link)
+        _remember(pager, node)
         return node
 
     def save(self, pager):
@@ -108,6 +114,16 @@ class Node:
                 pos += INTERIOR_CELL.size
                 page[pos:pos + len(k)] = k
                 pos += len(k)
+        _remember(pager, self)
+
+
+NODE_CACHE_LIMIT = 4096
+
+
+def _remember(pager, node):
+    if len(pager.nodes) >= NODE_CACHE_LIMIT:
+        pager.nodes.clear()
+    pager.nodes[node.pgno] = node
 
 
 class BTree:
@@ -200,6 +216,7 @@ class BTree:
 
     def _insert(self, pgno, key, value, replace):
         node = self._load(pgno)
+        appended = False
         if node.is_leaf:
             i = bisect_left(node.keys, key)
             if i < len(node.keys) and node.keys[i] == key:
@@ -209,6 +226,8 @@ class BTree:
             else:
                 node.keys.insert(i, key)
                 node.values.insert(i, value)
+                # past the last key of the rightmost leaf: ascending inserts
+                appended = i == len(node.keys) - 1 and node.link == 0
         else:
             i = bisect_right(node.keys, key)
             split = self._insert(node.children[i], key, value, replace)
@@ -221,11 +240,19 @@ class BTree:
         if node.size() <= USABLE:
             node.save(self.pager)
             return None
-        return self._split(node)
+        return self._split(node, appended)
 
-    def _split(self, node):
+    def _split(self, node, appended=False):
         right = Node(self.pager.allocate(), node.kind)
-        if node.is_leaf:
+        if node.is_leaf and appended:
+            # rows arriving in key order (autoincrement ids): leave the left
+            # page full and start the new one with just the new row. a middle
+            # split would leave every page half empty forever. SQLite does the same.
+            right.keys, node.keys = node.keys[-1:], node.keys[:-1]
+            right.values, node.values = node.values[-1:], node.values[:-1]
+            right.link, node.link = node.link, right.pgno
+            sep = right.keys[0]
+        elif node.is_leaf:
             # split by bytes, not count, so both halves fit even with mixed sizes
             total = node.size()
             acc = 0

@@ -50,6 +50,8 @@ class Pager:
         self.cache = OrderedDict()   # pgno -> bytearray, clean pages, LRU
         self.dirty = {}              # pgno -> bytearray, changed since commit
         self.originals = {}          # pgno -> bytes, content before this transaction
+        self.nodes = {}              # pgno -> parsed b+tree node, see btree.Node
+        self._savepoint = None       # pgno -> content when the statement began
 
         if exists:
             self._read_header()
@@ -108,10 +110,15 @@ class Pager:
 
     def write(self, pgno):
         """A page for modification. The original is kept for the journal."""
+        self.nodes.pop(pgno, None)
         page = self.dirty.get(pgno)
         if page is not None:
+            if self._savepoint is not None and pgno not in self._savepoint:
+                self._savepoint[pgno] = bytes(page)
             return page
         page = self.read(pgno)
+        if self._savepoint is not None and pgno not in self._savepoint:
+            self._savepoint[pgno] = None   # wasn't dirty: rolling back means "clean again"
         if pgno < self._committed_header[0]:
             self.originals.setdefault(pgno, bytes(page))
         self.cache.pop(pgno, None)
@@ -126,6 +133,9 @@ class Pager:
             pgno = self.page_count
             self.page_count += 1
             self.dirty[pgno] = bytearray(PAGE_SIZE)
+            self.nodes.pop(pgno, None)
+            if self._savepoint is not None:
+                self._savepoint.setdefault(pgno, None)
             return pgno
         page = self.write(pgno)
         page[:] = bytes(PAGE_SIZE)
@@ -190,24 +200,36 @@ class Pager:
     def rollback(self):
         self.dirty.clear()
         self.originals.clear()
+        self.nodes.clear()
+        self._savepoint = None
         self.page_count, self.freelist, self.schema_root = self._committed_header
 
     def savepoint(self):
-        """Snapshot of the uncommitted state, so one failed statement can be
-        undone without losing the rest of an open transaction."""
-        return (
-            {pgno: bytes(page) for pgno, page in self.dirty.items()},
-            (self.page_count, self.freelist, self.schema_root),
-        )
+        """Start tracking changes so one failed statement can be undone without
+        losing the rest of an open transaction.
+
+        Copy-on-write: a page is copied the first time the statement touches
+        it, so a savepoint costs nothing up front. (The first version copied
+        every dirty page at the start of every statement, which made a long
+        transaction quadratic.)"""
+        self._savepoint = {}
+        self._savepoint_header = (self.page_count, self.freelist, self.schema_root)
+        return self._savepoint
+
+    def release(self):
+        self._savepoint = None
 
     def rollback_to(self, savepoint):
-        pages, (self.page_count, self.freelist, self.schema_root) = savepoint
-        for pgno in list(self.dirty):
-            if pgno not in pages:
-                del self.dirty[pgno]
+        for pgno, content in savepoint.items():
+            if content is None:
+                # clean (or not allocated) when the statement began
+                self.dirty.pop(pgno, None)
                 self.originals.pop(pgno, None)
-        for pgno, data in pages.items():
-            self.dirty[pgno] = bytearray(data)
+            else:
+                self.dirty[pgno] = bytearray(content)
+        self.page_count, self.freelist, self.schema_root = self._savepoint_header
+        self.nodes.clear()
+        self._savepoint = None
 
     # --- recovery -------------------------------------------------------------
 
